@@ -5,9 +5,8 @@ Fixes vs v3:
   1. max_model_len = 4096   (was 8192 → only 12 concurrent sequences on V100)
   2. prompt max_length = 2000  (2000 prompt + 2048 output = 4048 < 4096)
   3. max_tokens = 2048          (realistic output length)
-  4. max_num_batched_tokens per role:
-       SHORT server = 512   (smaller chunks → more decode steps → faster E2E)
-       LONG  server = 2048  (larger chunks → efficient LONG prefill)
+ 
+     
 
 V100 32GB KV budget at util=0.90:
   available KV = 32×0.90 − 16 (weights) = 12.8 GB
