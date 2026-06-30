@@ -26,17 +26,16 @@ tailor/
 ├── tailor_ui.py                       ← Interactive pipeline launcher (start here)
 │
 ├── phase1_corpus/
-│   └── run_inference_vllm.py          ← Corpus creation via LLM inference
+│   ├── run_inference_vllm.py          ← Corpus creation via LLM inference
+│   └── feature_extractor.py           ← Shared prompt feature extraction (v13)
 │
 ├── phase2_training/
 │   ├── train_2class_advancedfeatures.py  ← Classifier training (XGB/Cat/RF)
 │   └── knee_new.py                    ← Concurrency profiling (M_Seq sweep)
 │
 ├── phase3_evaluation/
-│   ├── rq3_eval_final.py              ← Main evaluation (rate sweep)
+│   ├── rq4_evaluation.py              ← Main evaluation (rate sweep)
 │   └── sensitivity_analysis.py        ← Routing parameter sensitivity study
-│
-├── feature_extractor.py               ← Shared prompt feature extraction (v13)
 │
 ├── load_predictor/                    ← PreServe mLSTM baseline (adapted)
 │   └── predictor.py
@@ -85,7 +84,7 @@ tailor/
                           ▼
 ┌─────────────────────────────────────────────────────────────────┐
 │  Phase 3              Evaluation                               │
-│  phase3_evaluation/rq3_eval_final.py                           │
+│  phase3_evaluation/rq4_evaluation.py                           │
 │  Runs Static-RR, TAILOR (CFG1/CFG2/CFG3), and PreServe        │
 │  across arrival rates 8–72 req/s on two GPUs.                 │
 │  → Output: rq3_results_sweep.csv                               │
@@ -96,15 +95,19 @@ tailor/
 
 ## Supported Models
 
-| # | Name | HuggingFace ID | Token Threshold |
-|---|------|---------------|-----------------|
-| 1 | Llama-2-7B-AWQ | `TheBloke/Llama-2-7B-Chat-AWQ` | 200 |
-| 2 | Llama-2-13B | `meta-llama/Llama-2-13b-chat-hf` | 400 |
-| 3 | Mistral-7B-v0.1 | `mistralai/Mistral-7B-Instruct-v0.1` | 300 |
-| 4 | Mistral-7B-v0.2 | `mistralai/Mistral-7B-Instruct-v0.2` | 300 |
-| 5 | Mistral-Nemo-12B | `mistralai/Mistral-Nemo-Instruct-2407` | 400 |
-| 6 | DeepSeek-R1-Llama-8B | `deepseek-ai/DeepSeek-R1-Distill-Llama-8B` | 1000 |
-| 7 | DeepSeek-R1-Qwen-14B | `deepseek-ai/DeepSeek-R1-Distill-Qwen-14B` | 600 |
+| # | Name | HuggingFace ID | Token Threshold | Notes |
+|---|------|---------------|-----------------|-------|
+| 1 | Llama-2-7B-AWQ | `TheBloke/Llama-2-7B-Chat-AWQ` | 200 | |
+| 2 | Llama-2-13B | `meta-llama/Llama-2-13b-chat-hf` | 200 | 🔒 Gated — requires HF token + license acceptance |
+| 3 | Mistral-7B-v0.1 | `mistralai/Mistral-7B-Instruct-v0.1` | 300 | |
+| 4 | Mistral-7B-v0.2 | `mistralai/Mistral-7B-Instruct-v0.2` | 300 | |
+| 5 | Mistral-Nemo-12B | `mistralai/Mistral-Nemo-Instruct-2407` | 300 | |
+| 6 | DeepSeek-R1-Llama-8B | `deepseek-ai/DeepSeek-R1-Distill-Llama-8B` | 1000 | |
+| 7 | DeepSeek-R1-Qwen-14B | `deepseek-ai/DeepSeek-R1-Distill-Qwen-14B` | 600 | |
+
+> **🔒 Gated models** require a HuggingFace account token and acceptance of the model's license on its HF page. The TUI will prompt for the token automatically when a gated model is selected. Tokens can be created at https://huggingface.co/settings/tokens.
+
+> **Note on GPU compatibility:** AWQ quantization (Llama-2-7B-AWQ) requires GPU compute capability ≥ 7.5 (Turing or newer). It will not run on V100 (compute 7.0). All other models run on V100 with `dtype=float16`.
 
 ---
 
@@ -141,7 +144,7 @@ pip install autoawq
 python tailor_ui.py
 ```
 
-The TUI provides a numbered menu, handles model selection, and constructs all commands automatically.
+The TUI provides a numbered menu, handles model selection, dataset picking, HF token prompting for gated models, and constructs all commands automatically. Phases 1 and 2a are marked **Optional** and can be skipped if pre-built artifacts in `deploy/` and `data/` are present.
 
 ### Option B — Direct CLI
 
@@ -168,30 +171,39 @@ python phase2_training/train_2class_advancedfeatures.py \
 
 ```bash
 python phase2_training/knee_new.py \
-    --model mistralai/Mistral-7B-Instruct-v0.1 \
+    --model mistralai/Mistral-7B-Instruct-v0.2 \
     --threshold 300 \
     --gpu_gib 32 \
-    --weight_gib 13.5
+    --weight_gib 13.5 \
+    --short_configs 128,180,220,256,300 \
+    --long_configs 96,128,140,180,220
 ```
 
 #### Phase 3: Evaluation
 
 ```bash
-# Full sweep (all rates)
-python phase3_evaluation/rq3_eval_final.py \
+# Full sweep (all rates) — produces rq3_results_sweep.csv
+python phase3_evaluation/rq4_evaluation.py \
+    --model mistralai/Mistral-7B-Instruct-v0.2 \
     --rate-start 8 --rate-step 16 --rate-end 72
 
-# Single rate
-python phase3_evaluation/rq3_eval_final.py --rate 56.0
+# Single rate (quick check)
+python phase3_evaluation/rq4_evaluation.py \
+    --model mistralai/Mistral-7B-Instruct-v0.2 \
+    --rate 56.0
 ```
 
 #### Sensitivity Analysis
 
 ```bash
-python phase3_evaluation/sensitivity_analysis.py --reps 3
+python phase3_evaluation/sensitivity_analysis.py \
+    --model mistralai/Mistral-7B-Instruct-v0.2 \
+    --reps 3
 
 # Single parameter
-python phase3_evaluation/sensitivity_analysis.py --param delta_kv --reps 1
+python phase3_evaluation/sensitivity_analysis.py \
+    --model mistralai/Mistral-7B-Instruct-v0.2 \
+    --param delta_kv --reps 1
 ```
 
 ---
@@ -205,7 +217,8 @@ Pre-trained artifacts in `deploy/` allow Phase 3 to be run directly:
 ls deploy/v13_xgb.json deploy/v13_vectorizer.pkl instance_configs.json
 
 # Run evaluation
-python phase3_evaluation/rq3_eval_final.py \
+python phase3_evaluation/rq4_evaluation.py \
+    --model mistralai/Mistral-7B-Instruct-v0.2 \
     --rate-start 8 --rate-step 16 --rate-end 72
 ```
 
@@ -264,3 +277,5 @@ Pre-built corpus CSVs are provided in `data/`. Each file corresponds to one mode
   is disabled and other methods run normally.
 - All IPC temp files are written to `/tmp/rq3_*` and cleaned between runs.
 - Results are saved incrementally after each rate point to prevent data loss on interruption.
+- `PROJECT_ROOT` is derived automatically from the script location — no hardcoded paths. The repo can be cloned anywhere.
+- The `--model` flag is required for Phases 2b, 3, and Sensitivity Analysis when running directly via CLI. The TUI handles this automatically.
