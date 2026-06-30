@@ -5,8 +5,6 @@ Fixes vs v3:
   1. max_model_len = 4096   (was 8192 → only 12 concurrent sequences on V100)
   2. prompt max_length = 2000  (2000 prompt + 2048 output = 4048 < 4096)
   3. max_tokens = 2048          (realistic output length)
- 
-     
 
 V100 32GB KV budget at util=0.90:
   available KV = 32×0.90 − 16 (weights) = 12.8 GB
@@ -45,17 +43,10 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 from transformers import AutoTokenizer
 from vllm import AsyncLLMEngine, AsyncEngineArgs, SamplingParams
 
-# ── PreServe preserve baseline ────────────────────────────────────────────────
-import sys as _sys
-_PRESERVE_ROOT = "/workspace"
-if _PRESERVE_ROOT not in _sys.path:
-    _sys.path.insert(0, _PRESERVE_ROOT)
-
-PRESERVE_MODEL_PATH = "/workspace/deploy/1_claases-1_prompt-1_resample.pth"  # ← update if filename differs
-
 # ── GPU SM utilisation monitoring via pynvml ─────────────────────────────────
 try:
     import pynvml as _nvml
+    _nvml.nvmlInit()
     _GPU_HANDLES = {
         0: _nvml.nvmlDeviceGetHandleByIndex(0),
         1: _nvml.nvmlDeviceGetHandleByIndex(1),
@@ -81,7 +72,7 @@ except Exception as _e:
 
 PROJECT_ROOT = "/workspace"
 
-MODEL_ID     = "mistralai/Mistral-7B-Instruct-v0.1"
+MODEL_ID     = "TheBloke/Llama-2-7B-Chat-AWQ"
 VEC_PATH     = f"{PROJECT_ROOT}/deploy/v13_vectorizer.pkl"
 XGB_PATH     = f"{PROJECT_ROOT}/deploy/v13_xgb.json"
 INSTANCE_CFG = f"{PROJECT_ROOT}/instance_configs.json"
@@ -117,14 +108,14 @@ KV_STAT_DIR  = "/tmp/rq3_kv"
 # Send to preferred (class-matched) server unless preferred_score > alt_score + CLASS_BONUS
 CLASS_BONUS = 0.0    # pure load balance; increase toward 0.2 to add class preference
 
-STATIC_M_SEQS   = [ 180,240]   # tuned for max_model_len=4096, max_tokens=2048
+STATIC_M_SEQS   = [100, 140, 180,240, 300]   # tuned for max_model_len=4096, max_tokens=2048
 SINGLE_M_SEQS   = []
 
 # ── Adaptive M_Seq configurations ────────────────────────────────────────────
 # CFG1 = loaded from instance_configs.json (profiled optimal)
 # CFG2 and CFG3 = user-defined overrides  ← edit these before running
 ADAPTIVE_CFG2 = {"short_m_seq": 300, "long_m_seq": 180}
-#ADAPTIVE_CFG3 = {"short_m_seq": 300, "long_m_seq": 200}
+ADAPTIVE_CFG3 = {"short_m_seq": 300, "long_m_seq": 200}
 # Global params used by static/single baselines (max_tokens=2048, no class info)
 SAMPLING_PARAMS = SamplingParams(
     temperature=0.7,
@@ -148,7 +139,7 @@ def make_sampling_params(cls: str) -> SamplingParams:
         min_tokens=1,
         stop=["<|eot_id|>", "<|end_of_text|>"],
     )
-TARGET_PER_TYPE = 400
+TARGET_PER_TYPE = 170
 RANDOM_SEED     = 42
 
 BARRIER_DIR = "/tmp/rq3_barrier"
@@ -508,12 +499,8 @@ async def _worker_server_mode(args, engine_args, handler,
                     await writer.drain()
                     break
                 prompt, req_id = req["prompt"], req["req_id"]
-                if "max_tokens" in req:  # preserve dispatcher sends exact token budget
-                    sp = SamplingParams(temperature=0.7, max_tokens=int(req["max_tokens"]),
-                                        min_tokens=1, stop=["<|eot_id|>", "<|end_of_text|>"])
-                else:
-                    cls = req.get("cls", "LONG")
-                    sp  = make_sampling_params(cls) if cls in ("SHORT","LONG") else SAMPLING_PARAMS
+                cls = req.get("cls", "LONG")  # class from dispatcher
+                sp  = make_sampling_params(cls) if cls in ("SHORT","LONG") else SAMPLING_PARAMS
                 active_requests += 1
                 submit_t = time.perf_counter()
                 ttft, last_out = None, None
@@ -1000,158 +987,8 @@ async def _dispatcher(
 
 
 # =============================================================================
-# 10b. PRESERVE BASELINE  (PreServe load_5 routing + mLSTM predictor)
+# 11. STATS AGGREGATION
 # =============================================================================
-
-class _InstState:
-    """Per-instance load state for PreServe load_5 routing."""
-    __slots__ = ("prefill", "expected")
-    def __init__(self):           self.prefill = 0;  self.expected = 0
-    def load_5(self, p=2):        return self.prefill * p + self.expected
-    def on_dispatch(self, pl, po): self.prefill += pl; self.expected += pl + po
-    def on_done(self, pl, po):    self.prefill -= pl; self.expected -= (pl + po); self.expected = max(0, self.expected)
-
-
-def _build_load_predictor(model_path: str):
-    from load_predictor.predictor import LoadPredictor
-    pred = LoadPredictor({"req_predictor_model_path": model_path})
-    pred.predict("warm up")   # eliminate cold-start latency
-    print(f"[preserve] LoadPredictor ready — {model_path}", flush=True)
-    return pred
-
-
-async def _preserve_dispatcher(prompts, arrivals, load_predictor, port_a, port_b):
-    """
-    PreServe preserve routing:  route to min(load_5) instance.
-    Uses one TCP connection per request (matches existing worker handle_client design).
-    Returns (results_gpu_a, results_gpu_b).
-    """
-    n      = len(prompts)
-    ports  = [port_a, port_b]
-    states = [_InstState(), _InstState()]
-
-    # Pre-predict all output lengths (CPU, ~3ms each; done upfront to avoid dispatch lag)
-    print(f"[preserve] Predicting output lengths for {n} prompts...", flush=True)
-    pred_outs = []
-    for p in prompts:
-        raw = load_predictor.predict(p)
-        pred_outs.append(min(max(int(raw), 1), MAX_MODEL_LEN - 1))
-    print(f"[preserve] pred_out  mean={np.mean(pred_outs):.0f}"
-          f"  p50={np.percentile(pred_outs,50):.0f}"
-          f"  p95={np.percentile(pred_outs,95):.0f}", flush=True)
-
-    wall_start = time.perf_counter()
-    pending    = []   # list of (task, gpu_idx)
-
-    async def send_one(prompt, req_id, port, max_tokens):
-        r, w = await asyncio.open_connection("127.0.0.1", port)
-        w.write((json.dumps({"prompt": prompt, "req_id": req_id,
-                              "max_tokens": max_tokens}) + "\n").encode())
-        await w.drain()
-        resp = await r.readline()
-        w.close()
-        await w.wait_closed()
-        return json.loads(resp.decode())
-
-    for i in range(n):
-        elapsed = time.perf_counter() - wall_start
-        if (s := float(arrivals[i]) - elapsed) > 0:
-            await asyncio.sleep(s)
-
-        pred_out = pred_outs[i]
-        p_len    = len(prompts[i].split())   # word-count proxy for routing state
-        gpu_idx  = min(range(2), key=lambda j: states[j].load_5(2))
-        states[gpu_idx].on_dispatch(p_len, pred_out)
-
-        task = asyncio.create_task(send_one(prompts[i], f"pre-{i}", ports[gpu_idx], pred_out))
-        pending.append((task, gpu_idx, p_len, pred_out))
-
-    all_results = await asyncio.gather(*[t for t, *_ in pending], return_exceptions=True)
-
-    res_a, res_b = [], []
-    for (task, gpu_idx, p_len, pred_out), result in zip(pending, all_results):
-        states[gpu_idx].on_done(p_len, pred_out)
-        if isinstance(result, Exception):
-            continue
-        bucket = res_a if gpu_idx == 0 else res_b
-        bucket.append(result)
-
-    print(f"[preserve] GPU_A={len(res_a)}  GPU_B={len(res_b)}", flush=True)
-    return res_a, res_b
-
-
-def launch_preserve_realtime(
-    run_id, short_m_seq, long_m_seq, prompts, preds, rate, util, load_predictor, debug_kv=False,
-):
-    """Launch preserve routing experiment; returns (ra, rb) in same format as launch_adaptive_realtime."""
-    os.makedirs(BARRIER_DIR, exist_ok=True)
-    os.makedirs(RESULT_DIR,  exist_ok=True)
-    os.makedirs(KV_STAT_DIR, exist_ok=True)
-
-    loaded_a = os.path.join(BARRIER_DIR, f"{run_id}_A_loaded")
-    loaded_b = os.path.join(BARRIER_DIR, f"{run_id}_B_loaded")
-    go_file  = os.path.join(BARRIER_DIR, f"{run_id}_go")
-    done_a   = os.path.join(BARRIER_DIR, f"{run_id}_A_done")
-    done_b   = os.path.join(BARRIER_DIR, f"{run_id}_B_done")
-    res_a    = os.path.join(RESULT_DIR,  f"{run_id}_A.json")
-    res_b    = os.path.join(RESULT_DIR,  f"{run_id}_B.json")
-
-    for f in [loaded_a, loaded_b, go_file, done_a, done_b, res_a, res_b]:
-        if os.path.exists(f): os.remove(f)
-
-    print(f"\n  ▶ PRESERVE-A (GPU={GPU_A}, M_Seq={short_m_seq})")
-    proc_a = subprocess.Popen(
-        _make_worker_cmd("A", run_id, short_m_seq, util, None, None, debug_kv, server_mode=True),
-        env=_worker_env(GPU_A))
-    t0 = time.time()
-    while not os.path.exists(loaded_a):
-        if time.time()-t0 > 300: proc_a.kill(); raise TimeoutError("A")
-        if proc_a.poll() is not None: raise RuntimeError("preserve-A died")
-        time.sleep(0.2)
-    print(f"  ✓ PRESERVE-A loaded  (port {WORKER_PORTS[GPU_A]})")
-
-    print(f"\n  ▶ PRESERVE-B (GPU={GPU_B}, M_Seq={long_m_seq})")
-    proc_b = subprocess.Popen(
-        _make_worker_cmd("B", run_id, long_m_seq, util, None, None, debug_kv, server_mode=True),
-        env=_worker_env(GPU_B))
-    t0 = time.time()
-    while not os.path.exists(loaded_b):
-        if time.time()-t0 > 300: proc_a.kill(); proc_b.kill(); raise TimeoutError("B")
-        if proc_b.poll() is not None: proc_a.kill(); raise RuntimeError("preserve-B died")
-        time.sleep(0.2)
-    print(f"  ✓ PRESERVE-B loaded  (port {WORKER_PORTS[GPU_B]}) — both ready")
-
-    open(go_file, 'w').close()
-    print(f"  ✓ GO at {time.strftime('%H:%M:%S')}")
-    time.sleep(0.5)
-
-    arrivals  = generate_poisson_arrivals(len(prompts), rate, RANDOM_SEED)
-    raw_a, raw_b = asyncio.run(_preserve_dispatcher(
-        prompts, arrivals, load_predictor,
-        WORKER_PORTS[GPU_A], WORKER_PORTS[GPU_B],
-    ))
-
-    open(done_a, 'w').close()
-    open(done_b, 'w').close()
-    proc_a.wait(); proc_b.wait()
-
-    def _to_result(raw_list, role):
-        ttfts = [r.get("ttft", 0.0) for r in raw_list]
-        e2es  = [r.get("e2e",  0.0) for r in raw_list]
-        tok   = sum(r.get("tokens", 0) for r in raw_list)
-        wall  = max(e2es) if e2es else 0.0
-        return {"role": role, "wall": wall, "tokens": tok,
-                "kv_avg": 0.0, "kv_peak": 0.0, "preemptions": 0,
-                "ttfts": ttfts, "e2es": e2es}
-
-    ra = _to_result(raw_a, "A")
-    rb = _to_result(raw_b, "B")
-
-    with open(res_a, 'w') as f: json.dump(ra, f)
-    with open(res_b, 'w') as f: json.dump(rb, f)
-
-    print(f"\n  Preserve routing: A={len(raw_a)}  B={len(raw_b)}")
-    return ra, rb
 
 def _pct(arr, p):
     return float(np.percentile(arr, p)) if arr else 0.0
@@ -1235,7 +1072,7 @@ def load_classifier():
 # 13. SINGLE-RATE EVALUATION
 # =============================================================================
 
-def evaluate(rate, cfg, prompts, preds, debug_kv=False, load_predictor=None):
+def evaluate(rate, cfg, prompts, preds, debug_kv=False):
     short_m_seq = cfg["SHORT"]["optimal_m_seq"]
     long_m_seq  = cfg["LONG"]["optimal_m_seq"]
     n           = len(prompts)
@@ -1330,7 +1167,7 @@ def evaluate(rate, cfg, prompts, preds, debug_kv=False, load_predictor=None):
     adaptive_cfgs = [
         ("ADAPTIVE_CFG1", short_m_seq,                        long_m_seq),
         ("ADAPTIVE_CFG2", ADAPTIVE_CFG2["short_m_seq"],       ADAPTIVE_CFG2["long_m_seq"]),
-        #("ADAPTIVE_CFG3", ADAPTIVE_CFG3["short_m_seq"],       ADAPTIVE_CFG3["long_m_seq"]),
+        ("ADAPTIVE_CFG3", ADAPTIVE_CFG3["short_m_seq"],       ADAPTIVE_CFG3["long_m_seq"]),
     ]
 
     for cfg_label, s_mseq, l_mseq in adaptive_cfgs:
@@ -1372,45 +1209,6 @@ def evaluate(rate, cfg, prompts, preds, debug_kv=False, load_predictor=None):
             "Total_S":       s["wall_clock"],
         }))
 
-    # ── Preserve (PreServe mLSTM routing baseline) ───────────────────────────
-    if load_predictor is not None:
-        print("\n" + "="*60)
-        print(f"  PRESERVE  short_m={short_m_seq}  long_m={long_m_seq}  (rate={rate})")
-        print("="*60)
-
-        for d in [BARRIER_DIR, RESULT_DIR, PROMPTS_DIR, KV_STAT_DIR]:
-            if os.path.exists(d):
-                for fname in os.listdir(d):
-                    try: os.remove(os.path.join(d, fname))
-                    except Exception: pass
-
-        rs, rl = launch_preserve_realtime(
-            f"preserve_r{int(rate)}", short_m_seq, long_m_seq,
-            prompts, preds, rate, UTIL_PER_GPU, load_predictor, debug_kv,
-        )
-        s = compute_stats_parallel(rs, rl, "A", "B")
-        results_all.append(row({
-            "Method":         "PRESERVE",
-            "Routing":        "PreServe-mLSTM",
-            "Instances":      2,
-            "GPU":            f"{GPU_A}+{GPU_B}",
-            "M_Seq":          f"{short_m_seq}/{long_m_seq}",
-            "N_SHORT":        len(rs.get("ttfts", [])),
-            "N_LONG":         len(rl.get("ttfts", [])),
-            "TPS":            s["tps"],
-            "TTFT_P50_ALL":   s["ttft_p50_all"],
-            "TTFT_P95_ALL":   s["ttft_p95_all"],
-            "TTFT_P99_ALL":   s["ttft_p99_all"],
-            "TTFT_P95_SHORT": s["ttft_p95_A"],
-            "TTFT_P95_LONG":  s["ttft_p95_B"],
-            "E2E_P95_ALL":    s["e2e_p95_all"],
-            "KV_Avg":         s["kv_avg_pct"],
-            "KV_Peak":        s["kv_peak_pct"],
-            "Preemptions":    s["preemptions"],
-            "Preempt_Rate%":  s["preemption_rate"],
-            "Total_S":        s["wall_clock"],
-        }))
-
     # ── Per-rate summary ──────────────────────────────────────────────────────
     df        = pd.DataFrame(results_all)
     static_df = df[df["Method"].str.startswith("Static")]
@@ -1436,7 +1234,7 @@ def evaluate(rate, cfg, prompts, preds, debug_kv=False, load_predictor=None):
 # 14. RATE SWEEP
 # =============================================================================
 
-def evaluate_rate_sweep(rate_start=24.0, rate_step=16.0, rate_end=76.0, debug_kv=False):
+def evaluate_rate_sweep(rate_start=8.0, rate_step=16.0, rate_end=76.0, debug_kv=False):
     rates = list(np.arange(rate_start, rate_end + 1e-9, rate_step))
     print(f"\n🔁 Rates: {[round(r,1) for r in rates]}")
     print(f"   max_model_len={MAX_MODEL_LEN}  prompt_max={PROMPT_MAX_LEN}"
@@ -1454,16 +1252,23 @@ def evaluate_rate_sweep(rate_start=24.0, rate_step=16.0, rate_end=76.0, debug_kv
     preds                 = xgb_model.predict(features.values).flatten()
     print(f"   SHORT={int((preds==0).sum())}  LONG={int((preds==1).sum())}")
 
-    # ── Load mLSTM predictor once for preserve baseline ───────────────────────
-    load_predictor = None
-    if os.path.exists(PRESERVE_MODEL_PATH):
-        try:
-            load_predictor = _build_load_predictor(PRESERVE_MODEL_PATH)
-        except Exception as e:
-            print(f"⚠  PreServe predictor load failed ({e}) — PRESERVE skipped")
-    else:
-        print(f"⚠  {PRESERVE_MODEL_PATH} not found — PRESERVE skipped (train first)")
 
+    # ── Classifier overhead measurement ───────────────────────────────────────
+    print('\n[Classifier] Measuring per-prompt overhead...')
+    _times_total, _times_clf = [], []
+    for _p in prompts:
+        _t0 = time.perf_counter()
+        _f, _ = extract_v13_features([_p], vectorizer)
+        _ = xgb_model.predict(_f.values)
+        _times_total.append((time.perf_counter() - _t0) * 1000)
+        _t0 = time.perf_counter()
+        _ = xgb_model.predict(_f.values)
+        _times_clf.append((time.perf_counter() - _t0) * 1000)
+    print(f"   Total (feat+clf): mean={np.mean(_times_total):.3f}ms  p50={np.percentile(_times_total,50):.3f}ms  p95={np.percentile(_times_total,95):.3f}ms  sum={sum(_times_total):.0f}ms")
+    print(f"   XGBoost only:     mean={np.mean(_times_clf):.3f}ms  p50={np.percentile(_times_clf,50):.3f}ms  p95={np.percentile(_times_clf,95):.3f}ms  sum={sum(_times_clf):.0f}ms")
+    import pandas as _pd2
+    _pd2.DataFrame({'total_ms': _times_total, 'clf_ms': _times_clf}).to_csv('classifier_overhead.csv', index=False)
+    print('   Saved -> classifier_overhead.csv')
     all_rows, failed = [], []
 
     for i, rate in enumerate(rates):
@@ -1478,7 +1283,7 @@ def evaluate_rate_sweep(rate_start=24.0, rate_step=16.0, rate_end=76.0, debug_kv
                     except Exception: pass
 
         try:
-            rows = evaluate(rate, cfg, prompts, preds, debug_kv, load_predictor)
+            rows = evaluate(rate, cfg, prompts, preds, debug_kv)
             all_rows.extend(rows)
             pd.DataFrame(all_rows).to_csv("rq3_results_sweep.csv", index=False)
             print(f"\n  💾 {len(all_rows)} rows → rq3_results_sweep.csv")
@@ -1492,7 +1297,7 @@ def evaluate_rate_sweep(rate_start=24.0, rate_step=16.0, rate_end=76.0, debug_kv
     if failed: print(f"  Failed: {failed}")
     print(f"{'═'*100}")
 
-    adp_labels = ["ADAPTIVE_CFG1", "ADAPTIVE_CFG2"]#, "ADAPTIVE_CFG3"]
+    adp_labels = ["ADAPTIVE_CFG1", "ADAPTIVE_CFG2", "ADAPTIVE_CFG3"]
     print(f"\n  {'Rate':>6}  {'Method':<16} {'TTFT_P95':>10} {'Δ_TTFT':>8}  {'E2E_P95':>9} {'Δ_E2E':>7}  {'N_S':>5} {'N_L':>5}")
     print(f"  {'─'*6}  {'─'*16} {'─'*10} {'─'*8}  {'─'*9} {'─'*7}  {'─'*5} {'─'*5}")
     for rate in rates:
@@ -1534,7 +1339,7 @@ if __name__ == "__main__":
     parser.add_argument("--budgets-file",  type=str,   default="")
     parser.add_argument("--debug-kv",      action="store_true")
     parser.add_argument("--rate",          type=float, default=None)
-    parser.add_argument("--rate-start",    type=float, default=24.0)
+    parser.add_argument("--rate-start",    type=float, default=8.0)
     parser.add_argument("--rate-step",     type=float, default=16.0)
     parser.add_argument("--rate-end",      type=float, default=76.0)
     args = parser.parse_args()
