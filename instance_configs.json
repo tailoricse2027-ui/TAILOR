@@ -1,0 +1,18 @@
+{
+  "SHORT": {
+    "group": "SHORT",
+    "optimal_m_seq": 220,
+    "gpu_mem_util": 0.9,
+    "tps": 1127.3,
+    "kv_avg_pct": 22.03,
+    "kv_peak_pct": 32.6
+  },
+  "LONG": {
+    "group": "LONG",
+    "optimal_m_seq": 140,
+    "gpu_mem_util": 0.9,
+    "tps": 1253.36,
+    "kv_avg_pct": 36.17,
+    "kv_peak_pct": 49.2
+  }
+}

@@ -32,6 +32,7 @@ import subprocess
 import sys
 import time
 import joblib
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -70,7 +71,7 @@ except Exception as _e:
 # CONFIGURATION
 # =============================================================================
 
-PROJECT_ROOT = "/workspace"
+PROJECT_ROOT = str(Path(__file__).resolve().parent.parent)
 
 MODEL_ID     = "TheBloke/Llama-2-7B-Chat-AWQ"
 VEC_PATH     = f"{PROJECT_ROOT}/deploy/v13_vectorizer.pkl"
@@ -563,6 +564,7 @@ def _make_worker_cmd(role, run_id, m_seq, gpu_mem, pfile, afile,
         "--prompts-file",  pfile or "/dev/null",
         "--arrivals-file", afile or "/dev/null",
         "--budgets-file",  bfile or "",
+        "--model",         MODEL_ID,
     ]
     if debug_kv:    cmd.append("--debug-kv")
     if server_mode: cmd.append("--server-mode")
@@ -1326,7 +1328,9 @@ def evaluate_rate_sweep(rate_start=8.0, rate_step=16.0, rate_end=76.0, debug_kv=
 # ENTRYPOINT
 # =============================================================================
 
-if __name__ == "__main__":
+def main():
+    global MODEL_ID, TOKEN_THRESHOLD
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--worker",        action="store_true")
     parser.add_argument("--server-mode",   action="store_true")
@@ -1342,7 +1346,12 @@ if __name__ == "__main__":
     parser.add_argument("--rate-start",    type=float, default=8.0)
     parser.add_argument("--rate-step",     type=float, default=16.0)
     parser.add_argument("--rate-end",      type=float, default=76.0)
+    parser.add_argument("--model",         type=str,   default=None)
     args = parser.parse_args()
+
+    if args.model:
+        MODEL_ID        = args.model
+        TOKEN_THRESHOLD = MODEL_THRESHOLDS.get(MODEL_ID, TOKEN_THRESHOLD)
 
     if args.worker:
         asyncio.run(worker_main(args))
@@ -1359,3 +1368,7 @@ if __name__ == "__main__":
         print(f"✅ {out}")
     else:
         evaluate_rate_sweep(args.rate_start, args.rate_step, args.rate_end, args.debug_kv)
+
+
+if __name__ == "__main__":
+    main()

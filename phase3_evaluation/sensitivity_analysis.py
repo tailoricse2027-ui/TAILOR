@@ -44,8 +44,8 @@ import copy
 import numpy as np
 import pandas as pd
 
-sys.path.insert(0, "/workspace")
-import rq3_eval_final as m
+sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parent))
+import rq4_evaluation as m
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Default parameter values (from rq3_eval_final.py)
@@ -383,7 +383,13 @@ if __name__ == "__main__":
         help="Arrival rate in req/s (default: 56)")
     parser.add_argument("--reps",   type=int,   default=3,
         help="Repetitions per grid point (default: 3)")
+    parser.add_argument("--model",  type=str,   default=None,
+        help="HuggingFace model ID to use (overrides default in rq4_evaluation.py)")
     args = parser.parse_args()
+
+    if args.model:
+        m.MODEL_ID        = args.model
+        m.TOKEN_THRESHOLD = m.MODEL_THRESHOLDS.get(args.model, m.TOKEN_THRESHOLD)
 
     params_to_run = [args.param] if args.param else list(SWEEP_GRIDS.keys())
 

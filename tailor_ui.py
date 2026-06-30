@@ -48,13 +48,15 @@ MODELS = {
         "quant":   "awq",
         "thresh":  200,
         "dataset": "llama2-7b-awq",
+        "gated":   False,
     },
     "2": {
         "name":    "Llama-2-13B",
         "hf_id":   "meta-llama/Llama-2-13b-chat-hf",
         "quant":   None,
-        "thresh":  400,
+        "thresh":  200,
         "dataset": "llama2-13b-dolly",
+        "gated":   True,
     },
     "3": {
         "name":    "Mistral-7B-v0.1",
@@ -62,6 +64,7 @@ MODELS = {
         "quant":   None,
         "thresh":  300,
         "dataset": "mistral-7b-dolly",
+        "gated":   False,
     },
     "4": {
         "name":    "Mistral-7B-v0.2",
@@ -69,13 +72,15 @@ MODELS = {
         "quant":   None,
         "thresh":  300,
         "dataset": "mistral-7b-mixed",
+        "gated":   False,
     },
     "5": {
         "name":    "Mistral-Nemo-12B",
         "hf_id":   "mistralai/Mistral-Nemo-Instruct-2407",
         "quant":   None,
-        "thresh":  400,
+        "thresh":  300,
         "dataset": "mistral_nemo_12b",
+        "gated":   False,
     },
     "6": {
         "name":    "DeepSeek-R1-Distill-Llama-8B",
@@ -83,6 +88,7 @@ MODELS = {
         "quant":   None,
         "thresh":  1000,
         "dataset": "deepseek-r1-llama-8b",
+        "gated":   False,
     },
     "7": {
         "name":    "DeepSeek-R1-Distill-Qwen-14B",
@@ -90,14 +96,15 @@ MODELS = {
         "quant":   None,
         "thresh":  600,
         "dataset": "deepseek-r1-qwen-14b",
+        "gated":   False,
     },
 }
 
 SCRIPTS = {
-    "phase1": "run_inference_vllm.py",
-    "phase2a": "train_2class_advancedfeatures.py",
-    "phase2b": "knee_new.py",
-    "phase3":  "rq3_eval_final.py",
+    "phase1":  "phase1_corpus/run_inference_vllm.py",
+    "phase2a": "phase2_training/train_2class_advancedfeatures.py",
+    "phase2b": "phase2_training/knee_new.py",
+    "phase3":  "phase3_evaluation/rq4_evaluation.py",
 }
 
 
@@ -129,9 +136,13 @@ def model_table(title="Select a model"):
     t.add_column("Name",   style="white",       width=30)
     t.add_column("HuggingFace ID",              width=46)
     t.add_column("Token threshold", style="dim", width=16)
+    t.add_column("",       style="dim",         width=4)
     for k, m in MODELS.items():
-        t.add_row(k, m["name"], m["hf_id"], str(m["thresh"]))
+        lock = "[yellow]🔒[/yellow]" if m["gated"] else ""
+        t.add_row(k, m["name"], m["hf_id"], str(m["thresh"]), lock)
     console.print(t)
+    if any(m["gated"] for m in MODELS.values()):
+        console.print("  [dim]🔒 = requires HuggingFace login (gated model)[/dim]\n")
 
 
 def pick_model(allow_all=False) -> list[dict]:
@@ -139,7 +150,7 @@ def pick_model(allow_all=False) -> list[dict]:
     hint = "[0=all] " if allow_all else ""
     choices = list(MODELS.keys()) + (["0"] if allow_all else [])
     choice = Prompt.ask(
-        f"  Enter model number {hint}",
+        f"  Select a model {hint}",
         choices=choices,
         show_choices=False,
     )
@@ -148,9 +159,24 @@ def pick_model(allow_all=False) -> list[dict]:
     return [MODELS[choice]]
 
 
-def run_cmd(cmd: list[str], label: str):
+def maybe_ask_hf_token(models: list[dict]) -> dict:
+    """If any selected model is gated and HF_TOKEN isn't already set, prompt for it."""
+    if not any(m.get("gated") for m in models):
+        return {}
+    if os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN"):
+        return {}
+    console.print()
+    console.print("  [yellow]This model requires a HuggingFace access token.[/yellow]")
+    console.print("  [dim]Get one at https://huggingface.co/settings/tokens — "
+                  "you must also accept the model's license on its HF page.[/dim]")
+    token = Prompt.ask("  HuggingFace token (hf_...)", password=True)
+    return {"HF_TOKEN": token, "HUGGING_FACE_HUB_TOKEN": token}
+
+
+def run_cmd(cmd: list[str], label: str, extra_env: dict | None = None):
     console.print(f"\n  [dim]Running:[/dim] {' '.join(cmd)}\n")
-    result = subprocess.run(cmd)
+    env = {**os.environ, **(extra_env or {})}
+    result = subprocess.run(cmd, env=env)
     if result.returncode == 0:
         console.print(f"\n  [bold green]✓ {label} completed successfully.[/bold green]")
     else:
@@ -173,23 +199,53 @@ def phase1():
         return
 
     model = pick_model()[0]
-    console.print()
-
-    # Input source
-    src = Prompt.ask(
-        "  Input source",
-        choices=["dataset", "csv"],
-        default="dataset",
-    )
+    hf_env = maybe_ask_hf_token([model])
 
     cmd = [sys.executable, SCRIPTS["phase1"], "--model_name", model["hf_id"]]
 
-    if src == "dataset":
+    # Build dataset choices: always include Dolly, then scan data/ for local CSVs
+    dataset_options = {
+        "1": {
+            "label": "Dolly-15k  (HuggingFace: databricks/databricks-dolly-15k)",
+            "kind":  "hf",
+            "hf_id": "databricks/databricks-dolly-15k",
+        },
+    }
+    local_csvs = sorted(Path("data").glob("*.csv")) if Path("data").is_dir() else []
+    for i, csv_file in enumerate(local_csvs, start=2):
+        dataset_options[str(i)] = {
+            "label": f"Local CSV  →  {csv_file}",
+            "kind":  "csv",
+            "path":  str(csv_file),
+        }
+    dataset_options[str(len(dataset_options) + 1)] = {
+        "label": "Custom CSV path  (enter manually)",
+        "kind":  "custom_csv",
+    }
+
+    console.print()
+    console.print("  [bold cyan]Available input datasets:[/bold cyan]")
+    ds_table = Table(box=box.SIMPLE, show_header=False, padding=(0, 2))
+    ds_table.add_column("#",     style="bold yellow", width=4)
+    ds_table.add_column("Dataset", style="white")
+    for k, v in dataset_options.items():
+        ds_table.add_row(k, v["label"])
+    console.print(ds_table)
+
+    ds_choice = Prompt.ask(
+        "  Select dataset",
+        choices=list(dataset_options.keys()),
+        show_choices=False,
+    )
+    chosen_ds = dataset_options[ds_choice]
+
+    if chosen_ds["kind"] == "hf":
         num = Prompt.ask("  Number of prompts to sample", default="5000")
-        cmd += ["--dataset_name", "databricks/databricks-dolly-15k",
-                "--num_prompts", num]
+        cmd += ["--dataset_name", chosen_ds["hf_id"], "--num_prompts", num]
+    elif chosen_ds["kind"] == "csv":
+        cmd += ["--prompts_csv", chosen_ds["path"]]
     else:
-        csv_path = Prompt.ask("  Path to prompts CSV")
+        csv_path = Prompt.ask("  Path to prompts CSV (e.g. data/my_prompts.csv)")
         cmd += ["--prompts_csv", csv_path]
 
     out = Prompt.ask(
@@ -204,7 +260,7 @@ def phase1():
     if Confirm.ask("  Use natural stop (greedy decoding)?", default=False):
         cmd.append("--natural_stop")
 
-    run_cmd(cmd, "Phase 1 corpus creation")
+    run_cmd(cmd, "Phase 1 corpus creation", hf_env)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -261,6 +317,7 @@ def phase2b():
                   "  Output: [bold]instance_configs.json[/bold]\n")
 
     model = pick_model()[0]
+    hf_env = maybe_ask_hf_token([model])
 
     gpu_vram = Prompt.ask("  GPU VRAM in GiB (e.g. 32 for V100, 40/80 for A100)", default="32")
     weight   = Prompt.ask("  Model weight size in GiB (from vLLM startup log)",    default="13.5")
@@ -280,7 +337,7 @@ def phase2b():
         "--long_configs",  long_range,
     ]
 
-    run_cmd(cmd, "Phase 2b concurrency profiling")
+    run_cmd(cmd, "Phase 2b concurrency profiling", hf_env)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -295,7 +352,16 @@ def phase3():
                   "  Output: [bold]rq3_results_sweep.csv[/bold]\n")
 
     model = pick_model()[0]
+    hf_env = maybe_ask_hf_token([model])
     console.print(f"  [dim]Selected:[/dim] {model['hf_id']}\n")
+
+    console.print("  [bold cyan]Run mode:[/bold cyan]")
+    console.print("  [bold yellow]sweep[/bold yellow]  Runs the model at multiple arrival rates (e.g. 8 → 72 req/s in steps of 16).")
+    console.print("         Each rate is a separate ~90s experiment. All routing methods")
+    console.print("         (TAILOR, round-robin, single-queue) are compared at every rate.")
+    console.print("         Output: [bold]rq3_results_sweep.csv[/bold] — use this for the final paper results.\n")
+    console.print("  [bold yellow]single[/bold yellow] Runs just one arrival rate. Much faster (~90s total).")
+    console.print("         Useful for a quick sanity check or debugging a specific load point.\n")
 
     mode = Prompt.ask(
         "  Run mode",
@@ -303,7 +369,7 @@ def phase3():
         default="sweep",
     )
 
-    cmd = [sys.executable, SCRIPTS["phase3"]]
+    cmd = [sys.executable, SCRIPTS["phase3"], "--model", model["hf_id"]]
 
     if mode == "single":
         rate = Prompt.ask("  Arrival rate (req/s)", default="56.0")
@@ -317,12 +383,12 @@ def phase3():
     if Confirm.ask("  Enable KV debug logging?", default=False):
         cmd.append("--debug-kv")
 
-    console.print(f"\n  [yellow]⚠  Estimated runtime: "
-                  f"{'~90s per rate × n_methods' if mode=='sweep' else '~90s'}[/yellow]")
-    console.print(f"  [dim]Instance configs will be read from instance_configs.json[/dim]\n")
+    est = "~90s per rate point × number of steps" if mode == "sweep" else "~90s"
+    console.print(f"\n  [yellow]⚠  Estimated runtime: {est}[/yellow]")
+    console.print(f"  [dim]Instance configs read from instance_configs.json[/dim]\n")
 
     if Confirm.ask("  Start evaluation?", default=True):
-        run_cmd(cmd, "Phase 3 evaluation")
+        run_cmd(cmd, "Phase 3 evaluation", hf_env)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -337,6 +403,9 @@ def sensitivity():
                   "  Output: [bold]sensitivity_results.csv[/bold], "
                   "[bold]sensitivity_summary.csv[/bold]\n")
 
+    model = pick_model()[0]
+    hf_env = maybe_ask_hf_token([model])
+
     param = Prompt.ask(
         "  Parameter to sweep",
         choices=["delta_kv", "sm_idle_thresh", "max_steal", "class_bonus",
@@ -346,12 +415,12 @@ def sensitivity():
     rate = Prompt.ask("  Rate (req/s)", default="56.0")
     reps = Prompt.ask("  Repetitions per grid point", default="1")
 
-    cmd = [sys.executable, "sensitivity_analysis.py",
-           "--rate", rate, "--reps", reps]
+    cmd = [sys.executable, "phase3_evaluation/sensitivity_analysis.py",
+           "--model", model["hf_id"], "--rate", rate, "--reps", reps]
     if param != "all":
         cmd += ["--param", param]
 
-    run_cmd(cmd, "Sensitivity analysis")
+    run_cmd(cmd, "Sensitivity analysis", hf_env)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -402,8 +471,8 @@ def _importable(pkg: str) -> bool:
 
 MENU = [
     ("0", "Environment check",           check_env),
-    ("1", "Phase 1  — Corpus creation",  phase1),
-    ("2", "Phase 2a — Train classifier", phase2a),
+    ("1", "Phase 1  — Corpus creation  [dim](Optional)[/dim]",  phase1),
+    ("2", "Phase 2a — Train classifier [dim](Optional)[/dim]", phase2a),
     ("3", "Phase 2b — Concurrency profiling (knee point)", phase2b),
     ("4", "Phase 3  — Evaluation (rate sweep / single rate)", phase3),
     ("5", "Sensitivity analysis",        sensitivity),

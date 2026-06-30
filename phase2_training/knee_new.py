@@ -116,6 +116,8 @@ def run_benchmark(prompts: list[str], m_seq: int, model_id: str, name: str = "Ba
         model=model_id,
         max_num_seqs=m_seq,
         gpu_memory_utilization=0.95,
+        dtype="float16",
+        trust_remote_code=True,
         disable_log_stats=False,       # must be False — drives KV log lines
         enable_prefix_caching=False,   # disabled for clean benchmarking
     )
@@ -385,6 +387,8 @@ def launch_instances(
         model=model_id,
         max_num_seqs=sc['optimal_m_seq'],
         gpu_memory_utilization=sc['gpu_mem_util'],
+        dtype="float16",
+        trust_remote_code=True,
         disable_log_stats=False,
         enable_prefix_caching=False,
     )
@@ -397,6 +401,8 @@ def launch_instances(
         model=model_id,
         max_num_seqs=lc['optimal_m_seq'],
         gpu_memory_utilization=lc['gpu_mem_util'],
+        dtype="float16",
+        trust_remote_code=True,
         disable_log_stats=False,
         enable_prefix_caching=False,
     )
@@ -410,7 +416,23 @@ def launch_instances(
 # =============================================================================
 
 if __name__ == "__main__":
-    # Set single_gpu=True  → both instances share one GPU
-    # Set single_gpu=False → each instance on a dedicated GPU
-    # Set gpu_gib to your actual VRAM (40 for A100-40GB, 80 for A100-80GB / H100)
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--model",         default=MODEL_ID)
+    ap.add_argument("--threshold",     type=int,   default=TOKEN_THRESHOLD)
+    ap.add_argument("--gpu_gib",       type=float, default=GPU_GIB)
+    ap.add_argument("--weight_gib",    type=float, default=WEIGHT_GIB)
+    ap.add_argument("--short_configs", default=None)
+    ap.add_argument("--long_configs",  default=None)
+    args = ap.parse_args()
+
+    MODEL_ID        = args.model
+    TOKEN_THRESHOLD = args.threshold
+    GPU_GIB         = args.gpu_gib
+    WEIGHT_GIB      = args.weight_gib
+    if args.short_configs:
+        SHORT_CONFIGS = [int(x) for x in args.short_configs.split(",")]
+    if args.long_configs:
+        LONG_CONFIGS  = [int(x) for x in args.long_configs.split(",")]
+
     analyze_800(single_gpu=True, gpu_gib=GPU_GIB)
